@@ -27,6 +27,32 @@ no hacks, just clean policy enforcement that Brave respects natively.
 > **There are no official `.exe`, `.msi`, `.dmg`, `.pkg`, installers, or compiled binaries.**
 > If you find a download claiming to be SlimBrave-Neo elsewhere, it is not from this project. See [`SECURITY.md`](SECURITY.md).
 
+---
+
+## 中文说明（使用与路径）
+
+SlimBrave Neo 通过 Chromium/Brave 的“企业托管策略（Managed Policies）”来关闭遥测、精简功能并增强隐私安全。它不会修改浏览器安装文件、不需要扩展或注入。
+
+### 代码与文档入口
+
+- Linux 入口脚本：[`slimbrave-linux.py`](slimbrave-linux.py)
+- macOS 入口脚本：[`slimbrave-mac.py`](slimbrave-mac.py)
+- Windows 入口脚本：[`SlimBrave.ps1`](SlimBrave.ps1)
+- 预置配置（可导入/导出）：[`Presets/`](Presets/)
+- 代码 Wiki（中文，包含架构/模块/关键函数/依赖/运行方式）：[`docs/wiki/README.md`](docs/wiki/README.md)
+
+### 三平台策略写入路径（Policy Locations）
+
+- Linux：`/etc/brave/policies/managed/slimbrave.json`
+- macOS：`/Library/Managed Preferences/com.brave.Browser.plist`
+- Windows（注册表）：
+  - `HKLM:\SOFTWARE\Policies\BraveSoftware\Brave`
+  - `HKCU:\SOFTWARE\Policies\BraveSoftware\Brave`（兜底）
+
+### 界面语言
+
+当前仓库版本的 Linux/macOS TUI、CLI 帮助信息，以及 Windows GUI/弹窗文案均已提供中文显示（策略键名保持英文不变）。
+
 <div align="center">
 
 ---
@@ -167,6 +193,22 @@ Requires Administrator privileges.
 Import/export uses the same JSON format as the Windows PowerShell version.
 Configs are cross-platform compatible.
 
+### CLI 参数说明（中文，Linux/macOS）
+
+| 参数 | 说明 |
+|------|------|
+| `--import PATH` | 导入 SlimBrave Neo JSON 配置并应用策略 |
+| `--export PATH` | 将当前策略导出为 SlimBrave Neo JSON 配置 |
+| `--reset` | 删除 SlimBrave Neo 托管策略文件 |
+| `--policy-file PATH` | 覆盖策略文件路径（会限制在允许目录内） |
+| `--doh-templates URL` | 设置 DoH 模板 URL（用于 custom DNS 模式） |
+| `-h`, `--help` | 显示帮助 |
+
+允许的 `--policy-file` 目录（安全限制）：
+
+- Linux：`/etc/brave/policies/managed`、`/etc/chromium/policies/managed`
+- macOS：`/Library/Managed Preferences`、`/Library/Preferences`
+
 ---
 
 <details>
@@ -220,6 +262,8 @@ to platform-specific locations. Brave reads these on startup and enforces the po
 - **Linux:** `/etc/brave/policies/managed/slimbrave.json`
 - **macOS:** `/Library/Managed Preferences/com.brave.Browser.plist`
 - **Windows:** Registry keys via PowerShell
+  - `HKLM:\SOFTWARE\Policies\BraveSoftware\Brave`
+  - `HKCU:\SOFTWARE\Policies\BraveSoftware\Brave` (fallback)
 
 - Auto-detects Brave installations: Arch (`brave-bin`), deb/rpm, Flatpak, Snap, macOS App, and PATH fallback
 - Reads existing policies on startup and pre-checks matching features
