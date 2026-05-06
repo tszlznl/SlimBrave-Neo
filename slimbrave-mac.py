@@ -421,8 +421,16 @@ def repair_brave_prefs():
         return (0, running)
 
     try:
+        # Preserve the original file mode — Brave creates Preferences as 0600
+        # and the default _atomic_write mode would widen it to 0644, exposing
+        # session state (cookies, sync info) to other local users.
+        original_mode = os.stat(pref_path).st_mode & 0o777
         # Brave reads the file as compact JSON; preserve that shape.
-        _atomic_write(pref_path, json.dumps(prefs, separators=(",", ":")))
+        _atomic_write(
+            pref_path,
+            json.dumps(prefs, separators=(",", ":")),
+            mode=original_mode,
+        )
     except OSError:
         return (0, running)
 
@@ -1215,17 +1223,26 @@ def cli_export(path):
 
 
 def cli_reset():
-    """Non-interactive: delete the policy file."""
+    """Non-interactive: delete the policy file and repair leaked prefs."""
     try:
         if os.path.exists(POLICY_FILE):
             os.remove(POLICY_FILE)
             print(f"Removed {POLICY_FILE}")
         else:
             print(f"No policy file found at {POLICY_FILE}")
-        return 0
     except OSError as e:
         print(f"Error: {e}", file=sys.stderr)
         return 1
+
+    repaired, running = repair_brave_prefs()
+    if repaired > 0:
+        print(
+            f"Cleaned {repaired} leaked profile "
+            f"pref{'s' if repaired != 1 else ''} from Brave's user profile."
+        )
+    if running:
+        print("Note: Brave is running — fully close it before reopening.")
+    return 0
 
 
 def parse_args():
