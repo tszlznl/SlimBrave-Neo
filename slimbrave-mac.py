@@ -4,8 +4,8 @@
 Sets Chromium enterprise policies via JSON files on Linux or Plist on macOS. Requires root (sudo).
 
 Multi-channel support:
-  - macOS: each Brave channel (Stable / Beta / Nightly / Dev) has its own
-    bundle ID and Managed Preferences plist. When more than one channel is
+  - macOS: each Brave channel (Stable / Beta / Nightly) has its own bundle
+    ID and Managed Preferences plist. When more than one channel is
     detected, the TUI shows a Channels selector so policies can be applied
     per channel; CLI --channels=stable,beta selects the same.
   - Linux: all Brave channels share /etc/brave/policies/managed (hardcoded
@@ -33,6 +33,7 @@ import tempfile
 IS_MAC = sys.platform == "darwin"
 if IS_MAC:
     import plistlib
+    import uuid
     POLICY_DIR = "/Library/Managed Preferences"
     POLICY_FILE = os.path.join(POLICY_DIR, "com.brave.Browser.plist")
     # Directories a `--policy-file` argument is permitted to target on macOS.
@@ -41,6 +42,20 @@ if IS_MAC:
         "/Library/Managed Preferences",
         "/Library/Preferences",
     )
+
+    # Persistence on modern macOS (Apple Silicon / 13+):
+    # cfprefsd / mdmclient may clear directly-written /Library/Managed
+    # Preferences/*.plist files at reboot when no matching configuration
+    # profile is installed. With persist=on, a Configuration Profile is
+    # installed instead — Apple's recommended path. See README.
+    PERSIST_MODES = ("off", "on")
+    PERSIST_DEFAULT = "off"
+
+    # Configuration Profile (mode=on) — single mobileconfig wraps every
+    # selected channel's policies; one PayloadContent entry per channel.
+    PERSIST_PROFILE_IDENTIFIER = "io.github.slimbrave-neo.brave-policy"
+    PERSIST_PROFILE_DISPLAY = "SlimBrave Neo - Brave Policy"
+    PERSIST_PROFILE_FILE = "/tmp/slimbrave-neo-policy.mobileconfig"
 else:
     POLICY_DIR = "/etc/brave/policies/managed"
     POLICY_FILE = os.path.join(POLICY_DIR, "slimbrave.json")
@@ -48,6 +63,8 @@ else:
         "/etc/brave/policies/managed",
         "/etc/chromium/policies/managed",
     )
+    PERSIST_MODES = ("off",)
+    PERSIST_DEFAULT = "off"
 
 # Brave channel definitions. On macOS every channel ships with its own bundle
 # ID and Managed Preferences plist file (verified against brave-core
@@ -80,14 +97,6 @@ MAC_CHANNELS = [
         "user_data_dir": "Brave-Browser-Nightly",
         "process_name": "Brave Browser Nightly",
     },
-    {
-        "id": "dev",
-        "label": "Dev",
-        "app_name": "Brave Browser Dev.app",
-        "bundle_id": "com.brave.Browser.dev",
-        "user_data_dir": "Brave-Browser-Dev",
-        "process_name": "Brave Browser Dev",
-    },
 ]
 
 LINUX_CHANNELS = [
@@ -97,8 +106,6 @@ LINUX_CHANNELS = [
      "user_data_dir": "Brave-Browser-Beta", "process_name": "brave-browser-beta"},
     {"id": "nightly", "label": "Nightly",
      "user_data_dir": "Brave-Browser-Nightly", "process_name": "brave-browser-nightly"},
-    {"id": "dev", "label": "Dev",
-     "user_data_dir": "Brave-Browser-Dev", "process_name": "brave-browser-dev"},
 ]
 
 CHANNEL_IDS = [c["id"] for c in MAC_CHANNELS]
@@ -438,39 +445,20 @@ ROW_HEADER = 0
 ROW_FEATURE = 1
 ROW_DNS = 2
 ROW_DNS_TEMPLATE = 3
-ROW_CHANNEL = 4
 
 
 def build_rows(installations=None):
     """Return a list of dicts describing each visual row.
 
-    When `installations` is supplied and contains more than one entry on a
-    platform that benefits from per-channel selection (macOS), a "Brave
-    Channels" header and a checkbox row per channel are inserted at the
-    top. On Linux every channel writes to the same POLICY_FILE, so the
-    selector is suppressed even when multiple channels are detected.
+    The main list shows feature toggles + the DNS section. On macOS,
+    channel selection is asked at Apply time (see prompt_channel_selection)
+    rather than as a permanent row, so the main list stays focused on the
+    policies themselves regardless of how many channels are installed.
+    `installations` is accepted for symmetry with callers but isn't used
+    here anymore.
     """
+    del installations  # kept for API stability; no longer affects layout
     rows = []
-    if (
-        IS_MAC
-        and installations is not None
-        and len(installations) > 1
-    ):
-        rows.append({
-            "type": ROW_HEADER,
-            "text": "Brave Channels (select which to manage)",
-        })
-        for inst in installations:
-            rows.append({
-                "type": ROW_CHANNEL,
-                "text": inst["label"],
-                "channel_id": inst["channel"],
-                # Default unchecked. sync_channels_with_policy() will pre-check
-                # channels that already have a SlimBrave-written plist on disk,
-                # so a re-run shows you which channels are currently managed
-                # without forcing a write to channels you don't want touched.
-                "checked": False,
-            })
     for cat in CATEGORIES:
         rows.append({"type": ROW_HEADER, "text": cat["name"]})
         for feat in cat["features"]:
@@ -685,6 +673,209 @@ def repair_brave_prefs(installations=None):
 
 
 # ---------------------------------------------------------------------------
+# Persistence on macOS — off vs on (install a Configuration Profile) so
+# policies survive reboot on macOS 13+, where cfprefsd/mdmclient may clear
+# directly-written /Library/Managed Preferences/*.plist files without a
+# backing profile. See README's "Persistence on macOS" section.
+# ---------------------------------------------------------------------------
+
+
+def _stable_uuid(slug):
+    """Derive a deterministic UUID from a slug (uuid5 over DNS namespace).
+
+    Stable across runs so re-applying generates the same UUID — macOS then
+    treats an updated mobileconfig as an "update" instead of a new profile.
+    """
+    return str(uuid.uuid5(uuid.NAMESPACE_DNS, slug)).upper()
+
+
+def _is_profile_installed():
+    """True if the SlimBrave Neo Configuration Profile is in the system db.
+
+    Reads `profiles list -output stdout-xml` (a plist mapping a domain
+    label to an array of profile dicts) and scans for our identifier.
+    Returns False on any error so callers treat "unknown" the same as
+    "not installed" — the worst case is we redundantly remove a missing
+    profile, which is silent.
+    """
+    if not IS_MAC:
+        return False
+    try:
+        result = subprocess.run(
+            ["profiles", "list", "-output", "stdout-xml",
+             "-type", "configuration"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            timeout=10, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if result.returncode != 0 or not result.stdout:
+        return False
+    try:
+        data = plistlib.loads(result.stdout)
+    except Exception:
+        return False
+    for v in (data.values() if isinstance(data, dict) else []):
+        if not isinstance(v, list):
+            continue
+        for prof in v:
+            if (isinstance(prof, dict)
+                    and prof.get("ProfileIdentifier") == PERSIST_PROFILE_IDENTIFIER):
+                return True
+    return False
+
+
+def _build_mobileconfig(policy_by_bundle):
+    """Build a Configuration profile dict covering one or more channels.
+
+    `policy_by_bundle` maps bundle_id → policy dict. Each bundle becomes
+    a separate inner com.apple.ManagedClient.preferences payload, so a
+    single user-facing profile entry manages every selected channel.
+    """
+    inner_payloads = []
+    for bundle_id, policy in policy_by_bundle.items():
+        inner_payloads.append({
+            "PayloadType": "com.apple.ManagedClient.preferences",
+            "PayloadVersion": 1,
+            "PayloadIdentifier":
+                f"{PERSIST_PROFILE_IDENTIFIER}.payload.{bundle_id}",
+            "PayloadUUID": _stable_uuid(
+                f"{PERSIST_PROFILE_IDENTIFIER}.payload.{bundle_id}"
+            ),
+            "PayloadDisplayName": f"Brave Policy ({bundle_id})",
+            "PayloadContent": {
+                bundle_id: {
+                    "Forced": [{"mcx_preference_settings": dict(policy)}],
+                },
+            },
+        })
+    return {
+        "PayloadType": "Configuration",
+        "PayloadVersion": 1,
+        "PayloadIdentifier": PERSIST_PROFILE_IDENTIFIER,
+        "PayloadUUID": _stable_uuid(PERSIST_PROFILE_IDENTIFIER),
+        "PayloadDisplayName": PERSIST_PROFILE_DISPLAY,
+        "PayloadDescription": (
+            "Brave Browser enterprise policies managed by SlimBrave Neo. "
+            "Remove via SlimBrave Neo --reset or in System Settings."
+        ),
+        "PayloadOrganization": "SlimBrave Neo",
+        "PayloadScope": "System",
+        "PayloadContent": inner_payloads,
+    }
+
+
+def _remove_profile():
+    """Remove the SlimBrave Neo profile via the `profiles` CLI.
+
+    `profiles remove -identifier ... -forced` is the root-only path that
+    still works without a GUI on macOS 11+. Silent when nothing to remove.
+    """
+    if not IS_MAC:
+        return
+    try:
+        subprocess.run(
+            ["profiles", "remove",
+             "-identifier", PERSIST_PROFILE_IDENTIFIER,
+             "-type", "configuration",
+             "-forced"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=15, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def _install_profile_from_policy(policy_by_bundle):
+    """Generate the mobileconfig and hand it to System Settings.
+
+    macOS 11+ disallows CLI install of configuration profiles (see
+    `man profiles`), so the only path is `open <file.mobileconfig>`
+    which lets macOS route the file to System Settings > General >
+    Device Management for user approval. Any prior version is removed
+    first so the user sees a single fresh entry.
+
+    `open` is run as the invoking user (SUDO_USER) so LaunchServices
+    targets that user's GUI session — running it as root produces
+    inconsistent behaviour when the console user differs.
+    """
+    if _is_profile_installed():
+        _remove_profile()
+    mc = _build_mobileconfig(policy_by_bundle)
+    try:
+        # /tmp is world-readable but the profile contents aren't secret —
+        # they're the same policy key/values otherwise written to a
+        # world-readable system plist. 0o644 lets the user's `open` read
+        # the file when we drop privileges below.
+        _atomic_write(
+            PERSIST_PROFILE_FILE, plistlib.dumps(mc),
+            binary=True, mode=0o644,
+        )
+    except OSError as e:
+        return False, f"Failed to write mobileconfig: {e}"
+
+    sudo_user = os.environ.get("SUDO_USER")
+    if sudo_user and sudo_user != "root":
+        open_cmd = ["sudo", "-u", sudo_user, "open"]
+    else:
+        open_cmd = ["open"]
+    try:
+        subprocess.run(
+            open_cmd + [PERSIST_PROFILE_FILE],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=15, check=False,
+        )
+        # Also jump System Settings to the Device Management pane — the
+        # `open` of the .mobileconfig only queues the download on
+        # macOS 13+ and doesn't surface the install UI on its own.
+        subprocess.run(
+            open_cmd + [
+                "x-apple.systempreferences:com.apple.Profiles-Settings.extension"
+            ],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=15, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        # The .mobileconfig is on disk regardless; user can double-click
+        # it from Finder if the auto-open path fails.
+        pass
+    return True, ""
+
+
+def _flush_cfprefsd():
+    """Restart cfprefsd so it re-reads /Library/Managed Preferences/.
+
+    Without this, cfprefsd may keep returning a stale "not forced"
+    result after we change managed values, leaving Brave on the old
+    policy until next reboot. cfprefsd is designed to be restartable;
+    launchd respawns it on demand.
+    """
+    if not IS_MAC:
+        return
+    try:
+        subprocess.run(
+            ["/usr/bin/killall", "cfprefsd"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=5, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def _clear_persistence_artifacts():
+    """Remove any installed Configuration Profile.
+
+    Called by reset and by apply when switching modes (so an `off` Apply
+    after a previous `on` Apply cleanly tears the profile down). Plist
+    file deletion is the caller's responsibility — apply/reset already
+    iterate over plist_path targets.
+    """
+    if not IS_MAC:
+        return
+    _remove_profile()
+
+
+# ---------------------------------------------------------------------------
 # Policy I/O
 # ---------------------------------------------------------------------------
 
@@ -778,21 +969,13 @@ def _write_one_policy(plist_path, policy):
     return True, ""
 
 
-def _selected_channel_targets(installations, rows):
+def _selected_channel_targets(installations, selected_ids=None):
     """Return the subset of installations the user has actually selected.
 
-    On macOS multi-channel UI, ROW_CHANNEL rows in `rows` mark which
-    channels apply. When no ROW_CHANNEL rows exist (single-channel
-    installs, Linux, or CLI without --channels filtering), every
-    installation is targeted.
+    `selected_ids` is an optional set of channel id strings; when None
+    (single-channel installs, Linux, or `--channels` already filtered
+    installations upstream), every installation is targeted.
     """
-    selected_ids = None
-    for row in rows:
-        if row.get("type") == ROW_CHANNEL:
-            if selected_ids is None:
-                selected_ids = set()
-            if row.get("checked"):
-                selected_ids.add(row["channel_id"])
     if selected_ids is None:
         return list(installations)
     return [i for i in installations if i["channel"] in selected_ids]
@@ -813,8 +996,34 @@ def _dedupe_plist_targets(installations):
     return [(path, ", ".join(labels)) for path, labels in grouped.items()]
 
 
-def apply_policy(rows, installations=None):
-    """Write the policy to every selected channel's plist file."""
+def _bundle_id_for_plist(plist_path):
+    """Strip directory and `.plist` suffix to recover the bundle id."""
+    base = os.path.basename(plist_path)
+    return base[:-6] if base.endswith(".plist") else base
+
+
+def apply_policy(rows, installations=None, persist_mode=PERSIST_DEFAULT,
+                 selected_channel_ids=None):
+    """Write the policy with or without durable persistence.
+
+    Persistence modes (macOS only — Linux ignores `persist_mode` since
+    its /etc/brave/policies file is already durable):
+        off  Write plist to /Library/Managed Preferences/. May reset
+             after reboot on macOS 13+; useful for quick tests.
+        on   Install an Apple Configuration Profile via System Settings
+             so policies survive reboots. Requires a one-time GUI step.
+
+    Switching `on` ↔ `off` implicitly clears the previous artifact so
+    the on-disk state always matches the new mode.
+    """
+    if not IS_MAC and persist_mode != "off":
+        persist_mode = "off"
+    if persist_mode not in PERSIST_MODES:
+        return False, (
+            f"Unknown persist mode '{persist_mode}'. "
+            f"Valid: {', '.join(PERSIST_MODES)}."
+        )
+
     policy, err = _build_policy(rows)
     if policy is None:
         return False, err
@@ -822,49 +1031,100 @@ def apply_policy(rows, installations=None):
     if installations is None:
         targets = [(POLICY_FILE, "")]
     else:
-        targets = _dedupe_plist_targets(_selected_channel_targets(installations, rows))
+        targets = _dedupe_plist_targets(_selected_channel_targets(installations, selected_channel_ids))
 
     if not targets:
         return False, "No Brave channel selected. Check at least one channel."
 
+    # On macOS, drop any previously-installed profile so switching modes
+    # is never additive — e.g. an `off` Apply after a previous `on` Apply
+    # should leave only the plist, not both.
+    if IS_MAC:
+        _clear_persistence_artifacts()
+
     written_labels = []
-    for plist_path, label in targets:
-        ok, err = _write_one_policy(plist_path, policy)
+
+    if persist_mode == "on":
+        # Configuration Profile is cfprefsd's only forced source. Wipe
+        # any plist a prior `off` Apply left under /Library/Managed
+        # Preferences/ so cfprefsd doesn't see two competing sources
+        # for the same bundle.
+        policy_by_bundle = {}
+        for plist_path, label in targets:
+            try:
+                os.remove(plist_path)
+            except (FileNotFoundError, OSError):
+                pass
+            bundle = _bundle_id_for_plist(plist_path)
+            if bundle:
+                policy_by_bundle[bundle] = policy
+            if label:
+                written_labels.append(label)
+        if not policy_by_bundle:
+            return False, "No valid Brave channel bundle id found."
+        ok, err = _install_profile_from_policy(policy_by_bundle)
         if not ok:
-            scope = f" ({label})" if label else ""
-            return False, f"{err}{scope}"
-        if label:
-            written_labels.append(label)
+            return False, err
+    else:
+        # `off`: plain plist into /Library/Managed Preferences/. cfprefsd
+        # is flushed so it re-reads the fresh values instead of serving
+        # a stale "not managed" cache.
+        for plist_path, label in targets:
+            ok, err = _write_one_policy(plist_path, policy)
+            if not ok:
+                scope = f" ({label})" if label else ""
+                return False, f"{err}{scope}"
+            if label:
+                written_labels.append(label)
+        if IS_MAC:
+            _flush_cfprefsd()
 
     repair_targets = (
-        _selected_channel_targets(installations, rows)
+        _selected_channel_targets(installations, selected_channel_ids)
         if installations else None
     )
     return True, _post_apply_message(
-        *repair_brave_prefs(repair_targets), labels=written_labels,
+        *repair_brave_prefs(repair_targets),
+        labels=written_labels, persist_mode=persist_mode,
     )
 
 
-def _post_apply_message(repaired, brave_running, labels=None):
-    """Build the status message after a successful Apply or Reset."""
+def _post_apply_message(repaired, brave_running, labels=None,
+                        persist_mode=PERSIST_DEFAULT):
+    """Build the status message after a successful Apply."""
     scope = f" to {', '.join(labels)}" if labels else ""
-    base = f"Settings applied{scope}. Restart Brave to see changes."
-    if repaired > 0:
+    if persist_mode == "on":
         base = (
-            f"Applied{scope}; cleaned {repaired} leaked profile "
-            f"pref{'s' if repaired != 1 else ''}. Restart Brave."
+            f"Profile generated{scope}. Finish in "
+            "System Settings > General > Device Management."
         )
+    elif IS_MAC:
+        base = (
+            f"Settings applied{scope}. Restart Brave to see changes. "
+            "Persistence is off — values may reset on macOS 13+."
+        )
+    else:
+        base = f"Settings applied{scope}. Restart Brave to see changes."
+
+    if repaired > 0:
+        prefs = f"pref{'s' if repaired != 1 else ''}"
+        base += f" Cleaned {repaired} leaked profile {prefs}."
     if brave_running:
         base += " (Brave is running — fully close it before reopening.)"
     return base
 
 
-def reset_policy(rows, installations=None):
-    """Delete the policy file(s) and uncheck everything."""
+def reset_policy(rows, installations=None, selected_channel_ids=None):
+    """Reset all SlimBrave state: plists, profile, prefs leak.
+
+    Unconditionally tears down the Configuration Profile (if installed)
+    and every plist file, regardless of which mode was last used, so
+    --reset is always a clean slate.
+    """
     if installations is None:
         targets = [(POLICY_FILE, "")]
     else:
-        targets = _dedupe_plist_targets(_selected_channel_targets(installations, rows))
+        targets = _dedupe_plist_targets(_selected_channel_targets(installations, selected_channel_ids))
 
     if not targets:
         return False, "No Brave channel selected. Check at least one channel."
@@ -888,8 +1148,12 @@ def reset_policy(rows, installations=None):
     except OSError as e:
         return False, f"Failed to reset: {e}"
 
+    if IS_MAC:
+        _clear_persistence_artifacts()
+        _flush_cfprefsd()
+
     repair_targets = (
-        _selected_channel_targets(installations, rows)
+        _selected_channel_targets(installations, selected_channel_ids)
         if installations else None
     )
     repaired, running = repair_brave_prefs(repair_targets)
@@ -905,26 +1169,21 @@ def reset_policy(rows, installations=None):
     return True, msg
 
 
-def sync_channels_with_policy(rows, installations):
-    """Pre-check ROW_CHANNEL rows whose plist already holds a non-empty policy.
+def detect_managed_channel_ids(installations):
+    """Return the set of channel ids whose plist already holds a policy.
 
-    Channels start unchecked so a re-run never silently writes to a channel
-    the user didn't ask about. We tick the ones SlimBrave (or anything else)
-    has previously managed by reading each channel's plist; an empty/missing
-    plist leaves its channel row unchecked.
+    Used as the sticky default for the Apply-time channel prompt — so a
+    user who previously managed Stable + Beta sees those two pre-ticked
+    and can press Enter to keep the same scope.
     """
     if not installations:
-        return
-    by_id = {i["channel"]: i for i in installations}
-    for row in rows:
-        if row.get("type") != ROW_CHANNEL:
-            continue
-        inst = by_id.get(row.get("channel_id"))
-        if not inst:
-            continue
-        existing = _read_one_policy(inst["plist_path"])
+        return set()
+    managed = set()
+    for inst in installations:
+        existing = _read_one_policy(inst.get("plist_path") or "")
         if existing:
-            row["checked"] = True
+            managed.add(inst["channel"])
+    return managed
 
 
 def sync_rows_with_policy(rows, policy):
@@ -949,6 +1208,17 @@ def sync_rows_with_policy(rows, policy):
             if tmpl:
                 row["value"] = tmpl
                 row["cursor"] = len(tmpl)
+
+
+def detect_persist_mode():
+    """Detect whether persistence is currently in use on this Mac.
+
+    Returns "on" if the SlimBrave Neo Configuration Profile is in the
+    system db, otherwise "off". Non-macOS always returns "off".
+    """
+    if not IS_MAC:
+        return "off"
+    return "on" if _is_profile_installed() else "off"
 
 # ---------------------------------------------------------------------------
 # Import / Export (PS1-compatible JSON format)
@@ -1098,7 +1368,7 @@ def init_colors():
 def selectable_indices(rows):
     """Return list of row indices that can receive cursor focus."""
     return [i for i, r in enumerate(rows)
-            if r["type"] in (ROW_FEATURE, ROW_DNS, ROW_DNS_TEMPLATE, ROW_CHANNEL)]
+            if r["type"] in (ROW_FEATURE, ROW_DNS, ROW_DNS_TEMPLATE)]
 
 
 def draw(stdscr, rows, cursor_idx, scroll_offset, focus, btn_idx,
@@ -1166,13 +1436,6 @@ def draw(stdscr, rows, cursor_idx, scroll_offset, focus, btn_idx,
                 attr = curses.color_pair(CP_CHECKED)
             else:
                 attr = curses.color_pair(CP_NORMAL)
-        elif row["type"] == ROW_CHANNEL:
-            mark = "x" if row["checked"] else " "
-            line = f"    [{mark}] {row['text']}"
-            attr = (
-                curses.color_pair(CP_CHECKED) if row["checked"]
-                else curses.color_pair(CP_NORMAL)
-            )
         elif row["type"] == ROW_DNS:
             current = row["options"][row["selected"]]
             line = f"    < {current} >"
@@ -1310,6 +1573,145 @@ def prompt_text_input(stdscr, rows, cursor_idx, scroll_offset, btn_idx,
             cur += 1
 
 
+PERSIST_DESCRIPTIONS = {
+    "off": "plist only; values may reset after reboot on macOS 13+",
+    "on": "install Configuration Profile; durable, one-time GUI step",
+}
+
+
+def prompt_channel_selection(stdscr, rows, cursor_idx, scroll_offset, btn_idx,
+                             install_method, installations, default_ids):
+    """Ask which Brave channels to apply policies to (multi-select).
+
+    Renders a two-line prompt overlaid on the buttons row: one line of
+    `[x] Stable  [x] Beta  [ ] Nightly` style checkboxes, one line of
+    key hints. Left/right move the focus between channels, Space (or
+    Y/N) toggles the focused one, Enter confirms, Esc cancels.
+
+    `default_ids` pre-ticks whichever channels are already managed by
+    SlimBrave (sticky default) so re-Apply with no scope change is one
+    keystroke. Returns (ok, selected_ids_set).
+    """
+    channels = list(installations)
+    if not channels:
+        return True, set()
+    selected = set(default_ids or {i["channel"] for i in channels})
+    focus_idx = 0
+
+    def render():
+        draw(stdscr, rows, cursor_idx, scroll_offset,
+             FOCUS_BUTTONS, btn_idx, "", True, install_method)
+        max_y, max_x = stdscr.getmaxyx()
+        usable_w = max_x - 1
+        parts = ["  Apply to which Brave channels?"]
+        for i, inst in enumerate(channels):
+            mark = "x" if inst["channel"] in selected else " "
+            tag = f"[{mark}] {inst['label']}"
+            parts.append(f"<{tag}>" if i == focus_idx else f" {tag} ")
+        desc_line = "   ".join(parts)
+        keys_line = (
+            "  ←/→ move   Space toggle   Y/N toggle   "
+            "Enter=confirm   Esc=cancel"
+        )
+        try:
+            stdscr.addnstr(
+                max_y - 2, 0, desc_line.ljust(usable_w)[:usable_w],
+                usable_w, curses.color_pair(CP_TITLE) | curses.A_BOLD,
+            )
+            stdscr.addnstr(
+                max_y - 1, 0, keys_line.ljust(usable_w)[:usable_w],
+                usable_w, curses.color_pair(CP_STATUS_OK),
+            )
+        except curses.error:
+            pass
+        stdscr.refresh()
+
+    def toggle(i):
+        cid = channels[i]["channel"]
+        if cid in selected:
+            selected.discard(cid)
+        else:
+            selected.add(cid)
+
+    while True:
+        render()
+        key = stdscr.getch()
+        if key == 27:
+            return False, set()
+        if key in (curses.KEY_ENTER, 10, 13):
+            if not selected:
+                # No channel checked — keep prompting; an empty selection
+                # would be a no-op Apply that confuses users.
+                continue
+            return True, selected
+        if key == curses.KEY_LEFT:
+            focus_idx = (focus_idx - 1) % len(channels)
+        elif key == curses.KEY_RIGHT:
+            focus_idx = (focus_idx + 1) % len(channels)
+        elif key == ord(" "):
+            toggle(focus_idx)
+        elif key in (ord("y"), ord("Y")):
+            selected.add(channels[focus_idx]["channel"])
+        elif key in (ord("n"), ord("N")):
+            selected.discard(channels[focus_idx]["channel"])
+
+
+def prompt_persist_mode(stdscr, rows, cursor_idx, scroll_offset, btn_idx,
+                        install_method, current_mode):
+    """Ask the user whether to persist the policies across reboots.
+
+    Two-line prompt overlaid on the buttons row: the top line cycles
+    through `< on >` / `< off >` and shows the highlighted mode's
+    description; the bottom line lists the keys. ←/→ to browse, Y/N
+    for direct pick, Enter to confirm, Esc to cancel.
+
+    The highlight starts on `current_mode` (sticky default), so Enter
+    alone keeps whatever's currently installed — re-Apply with no
+    change is one keystroke.
+    """
+    if current_mode not in PERSIST_MODES:
+        current_mode = "off"
+    idx = PERSIST_MODES.index(current_mode)
+    while True:
+        mode = PERSIST_MODES[idx]
+        draw(stdscr, rows, cursor_idx, scroll_offset,
+             FOCUS_BUTTONS, btn_idx, "", True, install_method)
+        max_y, max_x = stdscr.getmaxyx()
+        usable_w = max_x - 1
+        desc_line = (
+            f"  Persist across reboots: < {mode} >    "
+            f"↳ {PERSIST_DESCRIPTIONS[mode]}"
+        )
+        keys_line = (
+            "  ←/→ select   Y/N quick-pick   "
+            "Enter=confirm   Esc=cancel"
+        )
+        try:
+            stdscr.addnstr(
+                max_y - 2, 0, desc_line.ljust(usable_w)[:usable_w],
+                usable_w, curses.color_pair(CP_TITLE) | curses.A_BOLD,
+            )
+            stdscr.addnstr(
+                max_y - 1, 0, keys_line.ljust(usable_w)[:usable_w],
+                usable_w, curses.color_pair(CP_STATUS_OK),
+            )
+        except curses.error:
+            pass
+        stdscr.refresh()
+
+        key = stdscr.getch()
+        if key == 27:
+            return False, ""
+        if key in (curses.KEY_ENTER, 10, 13):
+            return True, mode
+        if key in (curses.KEY_LEFT, curses.KEY_RIGHT):
+            idx = (idx + 1) % len(PERSIST_MODES)
+        elif key in (ord("y"), ord("Y")):
+            return True, "on"
+        elif key in (ord("n"), ord("N")):
+            return True, "off"
+
+
 def main(stdscr, override_installations=None):
     """Main TUI event loop.
 
@@ -1338,7 +1740,6 @@ def main(stdscr, override_installations=None):
     # Load existing policy and pre-check matching features
     policy = load_existing_policy(installations)
     sync_rows_with_policy(rows, policy)
-    sync_channels_with_policy(rows, installations)
 
     cursor_pos = 0          # index into sel[]
     cursor_idx = sel[0]     # index into rows[]
@@ -1496,9 +1897,6 @@ def main(stdscr, override_installations=None):
                 if row["type"] == ROW_FEATURE:
                     toggle_feature_row(rows, row)
                     status_msg = ""
-                elif row["type"] == ROW_CHANNEL:
-                    row["checked"] = not row["checked"]
-                    status_msg = ""
                 elif row["type"] == ROW_DNS:
                     row["selected"] = (row["selected"] + 1) % len(row["options"])
                     status_msg = ""
@@ -1514,6 +1912,41 @@ def main(stdscr, override_installations=None):
                     if dns_mode == "custom" and not dns_tmpl:
                         status_msg = "Custom DNS requires a DoH template URL."
                         status_ok = False
+                    elif IS_MAC:
+                        # Two macOS-only prompts, in order: scope (which
+                        # channels) first, mechanism (persist on/off)
+                        # second. Each prompt has a sticky default so a
+                        # one-keystroke Enter-Enter Apply re-uses prior
+                        # state.
+                        selected_ids = None
+                        if installations and len(installations) > 1:
+                            default_ids = (
+                                detect_managed_channel_ids(installations)
+                                or {i["channel"] for i in installations}
+                            )
+                            ok, selected_ids = prompt_channel_selection(
+                                stdscr, rows, cursor_idx, scroll_offset,
+                                btn_idx, install_method, installations,
+                                default_ids,
+                            )
+                            if not ok:
+                                status_msg = "Apply cancelled."
+                                status_ok = True
+                                continue
+                        current = detect_persist_mode()
+                        ok, persist_mode = prompt_persist_mode(
+                            stdscr, rows, cursor_idx, scroll_offset, btn_idx,
+                            install_method, current,
+                        )
+                        if not ok:
+                            status_msg = "Apply cancelled."
+                            status_ok = True
+                        else:
+                            status_ok, status_msg = apply_policy(
+                                rows, installations,
+                                persist_mode=persist_mode,
+                                selected_channel_ids=selected_ids,
+                            )
                     else:
                         status_ok, status_msg = apply_policy(rows, installations)
 
@@ -1565,9 +1998,6 @@ def main(stdscr, override_installations=None):
                 if row["type"] == ROW_FEATURE:
                     toggle_feature_row(rows, row)
                     status_msg = ""
-                elif row["type"] == ROW_CHANNEL:
-                    row["checked"] = not row["checked"]
-                    status_msg = ""
                 elif row["type"] == ROW_DNS:
                     row["selected"] = (row["selected"] + 1) % len(row["options"])
                     status_msg = ""
@@ -1602,7 +2032,8 @@ def _filter_installations_by_channels(installations, channel_spec):
     return filtered, ""
 
 
-def cli_import(path, installations, doh_templates=""):
+def cli_import(path, installations, doh_templates="",
+               persist_mode=PERSIST_DEFAULT):
     """Non-interactive: import config and apply policies."""
     rows = build_rows(installations)
     ok, msg = import_settings(rows, path)
@@ -1618,11 +2049,19 @@ def cli_import(path, installations, doh_templates=""):
                 row["value"] = doh_templates
                 break
 
-    ok, msg = apply_policy(rows, installations)
+    ok, msg = apply_policy(rows, installations, persist_mode=persist_mode)
     if not ok:
         print(f"Error: {msg}", file=sys.stderr)
         return 1
     print(msg)
+    if IS_MAC and persist_mode == "on":
+        # macOS 11+ disallows CLI-driven profile installs (see `man
+        # profiles`); finish the step in System Settings.
+        print(
+            "Finish in System Settings > General > Device Management: "
+            "double-click the downloaded profile and click Install. "
+            "See https://support.apple.com/guide/mac-help/mh35561/mac"
+        )
     return 0
 
 
@@ -1645,7 +2084,12 @@ def cli_export(path, installations):
 
 
 def cli_reset(installations):
-    """Non-interactive: delete the policy file(s) and repair leaked prefs."""
+    """Non-interactive: tear down every SlimBrave artifact and repair leaks.
+
+    Removes plist files, the Configuration Profile (if installed), and
+    repairs leaked Brave-profile prefs. Unconditional so a single
+    --reset always leaves a clean slate.
+    """
     targets = _dedupe_plist_targets(installations)
     if not targets:
         print(f"No policy file found at {POLICY_FILE}")
@@ -1666,6 +2110,14 @@ def cli_reset(installations):
     except OSError as e:
         print(f"Error: {e}", file=sys.stderr)
         return 1
+
+    if IS_MAC:
+        profile_was_installed = _is_profile_installed()
+        _clear_persistence_artifacts()
+        _flush_cfprefsd()
+        if profile_was_installed:
+            print(f"Removed Configuration Profile "
+                  f"({PERSIST_PROFILE_IDENTIFIER})")
 
     repaired, running = repair_brave_prefs(installations)
     if repaired > 0:
@@ -1711,6 +2163,17 @@ def parse_args():
             "comma-separated channels to target on macOS "
             f"({', '.join(CHANNEL_IDS)}). Default 'auto' = all detected. "
             "Linux ignores this flag because all channels share one policy file."
+        ),
+    )
+    parser.add_argument(
+        "--persist", metavar="MODE", default=None,
+        choices=list(PERSIST_MODES),
+        help=(
+            "macOS persistence: 'off' (plist only; may reset after reboot "
+            "on macOS 13+) or 'on' (install a Configuration Profile via "
+            "System Settings; durable, Apple-recommended). When omitted, "
+            "reuse whatever's currently installed; falls back to 'off' "
+            "if nothing is. Linux ignores this flag."
         ),
     )
     return parser.parse_args()
@@ -1773,12 +2236,20 @@ if __name__ == "__main__":
             for w in brave_info["warnings"]:
                 print(f"Warning: {w}", file=sys.stderr)
 
+        # Resolve --persist: when omitted, reuse whichever mode is
+        # currently installed (matches TUI's sticky default) so a
+        # re-run never silently demotes a profile back to plist-only.
+        persist_mode = args.persist
+        if persist_mode is None:
+            persist_mode = detect_persist_mode() if IS_MAC else PERSIST_DEFAULT
+
         rc = 0
         if args.reset:
             rc = cli_reset(installations)
         if args.import_path:
             rc = cli_import(args.import_path, installations,
-                            doh_templates=args.doh_templates or "")
+                            doh_templates=args.doh_templates or "",
+                            persist_mode=persist_mode)
         if args.export_path:
             rc = cli_export(args.export_path, installations)
         sys.exit(rc)
