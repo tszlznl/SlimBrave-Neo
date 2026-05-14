@@ -75,9 +75,26 @@ cd SlimBrave-Neo
 sudo python3 slimbrave-mac.py
 ```
 
-Policies are written to `/Library/Managed Preferences/com.brave.Browser.plist`. Requires root.
+Requires root. Policies are written to `/Library/Managed Preferences/com.brave.Browser.plist` by default; with `--persist on` an Apple Configuration Profile is installed instead.
 
-**Multiple Brave channels (Stable / Beta / Nightly):** each channel uses its own bundle ID and managed plist on macOS. When more than one channel is detected, the TUI shows a "Brave Channels" section at the top — channel rows are unchecked by default, and any channel that already has a SlimBrave-managed plist is pre-checked so a re-run shows you which channels are currently managed without writing to channels you didn't ask about. Pick the channels you want to apply to before clicking Apply.
+**Persistence on macOS (Apple Silicon / macOS 13+).** On modern macOS, `cfprefsd` and `mdmclient` may clear directly-written `/Library/Managed Preferences/*.plist` files at reboot when no Configuration Profile backs them, so policies don't always survive a restart. SlimBrave Neo offers two modes:
+
+| Mode | What it does | Persists | User action |
+|------|--------------|----------|-------------|
+| `off` (default) | Writes the plist only | may reset on macOS 13+ | just `sudo` |
+| `on` | Installs an Apple Configuration Profile via System Settings | yes, durable | `sudo` + one-time GUI install |
+
+When `--persist` is omitted on the CLI, the mode currently installed on the Mac is reused, so a re-run never silently demotes an installed profile back to plist-only. A fresh install defaults to `off`.
+
+When you click Apply in the TUI, SlimBrave Neo asks two macOS-only questions in order: which Brave channels to manage (only when more than one is installed), then whether to persist across reboots. Both prompts have a sticky default — Enter keeps whichever scope and mode are currently installed.
+
+```bash
+sudo python3 slimbrave-mac.py --import "./Presets/Maximum Privacy Preset.json" --persist on
+sudo python3 slimbrave-mac.py --import "./Presets/Maximum Privacy Preset.json" --persist off
+sudo python3 slimbrave-mac.py --reset
+```
+
+**Finishing the Configuration Profile install (macOS 26).** With `--persist on`, SlimBrave Neo writes a `.mobileconfig` and opens System Settings, but macOS 11+ disallows CLI-driven profile installs so you finish the step in the GUI: a "Profile Downloaded" notification appears; in System Settings click **General** → **Device Management**, scroll down to **Downloaded**, double-click **SlimBrave Neo - Brave Policy**, click **Install**, and enter your login password. Policies then take effect immediately and persist across reboots. To uninstall, run `--reset` or remove the profile under the same Device Management pane. Reference: [Apple — Install configuration profiles on Mac](https://support.apple.com/guide/mac-help/mh35561/mac).
 
 **CLI mode (non-interactive):**
 
@@ -85,9 +102,8 @@ Policies are written to `/Library/Managed Preferences/com.brave.Browser.plist`. 
 sudo python3 slimbrave-mac.py --import "./Presets/Maximum Privacy Preset.json"
 sudo python3 slimbrave-mac.py --export ~/SlimBraveNeoSettings.json
 sudo python3 slimbrave-mac.py --reset
-
-# Restrict CLI actions to specific channels (default: all detected)
 sudo python3 slimbrave-mac.py --import preset.json --channels stable,beta
+sudo python3 slimbrave-mac.py --import preset.json --persist on
 ```
 
 After applying, restart Brave and verify at `brave://policy`.
@@ -172,6 +188,7 @@ Requires Administrator privileges.
 | `--policy-file PATH` | Override policy file path |
 | `--doh-templates URL` | Set custom DNS-over-HTTPS template URL |
 | `--channels LIST` | Comma-separated channels to target (`stable,beta,nightly`). Default `auto` = all detected. macOS writes one plist per channel; Linux always shares a single policy file. |
+| `--persist MODE` | macOS persistence: `off` (plist only; may reset after reboot on macOS 13+) or `on` (install an Apple Configuration Profile via System Settings; durable, Apple-recommended). Omitted = reuse whatever mode is currently installed; falls back to `off` if nothing is. Linux ignores this flag — its `/etc/brave/policies` file is already durable. |
 | `-h`, `--help` | Show help |
 
 Import/export uses the same JSON format as the Windows PowerShell version. Configs are cross-platform compatible.
@@ -228,12 +245,13 @@ SlimBrave Neo writes Chromium [managed enterprise policies](https://chromeenterp
 | Platform | Policy Location |
 |----------|----------------|
 | Linux | `/etc/brave/policies/managed/slimbrave.json` (shared across all channels) |
-| macOS | `/Library/Managed Preferences/com.brave.Browser{,.beta,.nightly,.dev}.plist` (one per detected channel) |
+| macOS — `--persist off` | `/Library/Managed Preferences/com.brave.Browser{,.beta,.nightly}.plist` (one per selected channel). |
+| macOS — `--persist on` | Apple Configuration Profile installed via System Settings → General → Device Management. No plist files written; the profile system manages the values. |
 | Windows | Registry keys via PowerShell |
 
 **Additional behavior:**
 - Auto-detects Brave installations: Arch (`brave-bin`), deb/rpm, Flatpak, Snap, macOS App (Stable / Beta / Nightly), and PATH fallback
-- Reads existing policies on startup and pre-checks matching features; on macOS pre-checks any channel with an existing managed plist
+- Reads existing policies on startup and pre-checks matching features; on macOS, the Apply-time channel prompt pre-ticks channels that already have a SlimBrave-managed policy (sticky default)
 - Full overwrite on Apply, so unchecked features are cleanly removed
 - Import/export compatible with Windows PowerShell version (handles UTF-16 BOM encoding)
 
